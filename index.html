@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Ask Claude from Meta Ray-Ban Display glasses">
+<meta name="mrbd-web-app-capable" content="yes">
+<meta name="robots" content="noindex,nofollow">
+<meta name="referrer" content="no-referrer">
+<title>Claude</title>
+<style>
+  /* Additive display: pure black is transparent, so everything is bright on black. */
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body {
+    width: 100%; height: 100%;
+    background: #000; color: #fff;
+    overflow: hidden;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  body { display: flex; flex-direction: column; padding: 3vmin; gap: 2vmin; }
+
+  header {
+    display: flex; justify-content: space-between; align-items: baseline;
+    font-size: 3.6vmin; font-weight: 600; color: #ffb070;
+  }
+  #status { color: #9fd0ff; font-weight: 500; }
+
+  /* The one scroll owner. Scrolled by the Up / Down buttons. */
+  #out {
+    flex: 1; min-height: 0;
+    overflow-y: auto; scrollbar-width: none;
+    font-size: 5vmin; line-height: 1.32;
+    white-space: pre-wrap; overflow-wrap: anywhere;
+  }
+  #out::-webkit-scrollbar { display: none; }
+  #q { color: #ffb070; font-size: 4vmin; margin-bottom: 1.5vmin; }
+  #q:empty { display: none; }
+
+  form, .row { display: flex; gap: 2vmin; }
+  input, button {
+    font: inherit; font-size: 4.2vmin;
+    min-height: 10vmin;
+    color: #fff; background: #000;
+    border: 0.5vmin solid #8a8a8a; border-radius: 2.5vmin;
+    padding: 0 3vmin;
+  }
+  input { flex: 1; min-width: 0; }
+  input::placeholder { color: #9a9a9a; }
+  .row button { flex: 1; padding: 0; }
+  input:focus, button:focus {
+    outline: none; border-color: #fff;
+    background: #ffb070; color: #000;
+  }
+  input:focus::placeholder { color: #3a2a1a; }
+</style>
+</head>
+<body>
+  <header>
+    <span id="title">Claude</span>
+    <span id="status">ready</span>
+  </header>
+
+  <main id="out" aria-live="polite"><div id="q"></div><div id="a"></div></main>
+
+  <form id="form" autocomplete="off">
+    <input id="inp" type="text" placeholder="Ask Claude…" aria-label="Ask Claude"
+           autocomplete="off" autocapitalize="sentences" enterkeyhint="send">
+    <button id="send" type="submit">Send</button>
+  </form>
+
+  <div class="row">
+    <button id="up" type="button" aria-label="Scroll up">▲</button>
+    <button id="down" type="button" aria-label="Scroll down">▼</button>
+    <button id="new" type="button">New</button>
+    <button id="model" type="button">Model</button>
+  </div>
+
+<script>
+(function () {
+  'use strict';
+
+  var API_URL = 'https://api.anthropic.com/v1/messages';
+  var MODELS = [
+    ['Haiku', 'claude-haiku-5-5'],
+    ['Sonnet', 'claude-sonnet-5-5'],
+    ['Opus', 'claude-opus-5-5']
+  ];
+  var MAX_TURNS = 12;          // messages kept as context
+  var SYSTEM =
+    'You are Claude, answering on the small heads-up display of smart glasses. ' +
+    'The user writes short questions by hand, so input may contain typos or missing ' +
+    'Lithuanian diacritics; interpret it charitably. Reply in the language of the question ' +
+    '(Lithuanian or English). Be brief: lead with the answer, normally under 60 words, ' +
+    'unless the user asks for more. Plain text only: no markdown, no headings, no asterisks, ' +
+    'no tables. Use short lines or simple numbered lines for steps.';
+
+  var $ = function (id) { return document.getElementById(id); };
+  var out = $('out'), qEl = $('q'), aEl = $('a'), inp = $('inp');
+  var statusEl = $('status'), titleEl = $('title');
+
+  // --- storage (may fail or be cleared on the glasses) ---------------------
+  function load(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
+  function save(k, v) { try { localStorage.setItem(k, v); } catch (e) { /* ignore */ } }
+
+  // --- settings from the URL: ?key=sk-ant-...&model=sonnet -----------------
+  var search = new URLSearchParams(location.search);
+  var hash = new URLSearchParams(location.hash.replace(/^#/, ''));
+  function param(name) { return search.get(name) || hash.get(name); }
+
+  var key = param('key');
+  if (key) { save('cg_key', key); } else { key = load('cg_key'); }
+
+  var customModel = null;
+  var modelIdx = parseInt(load('cg_model') || '0', 10);
+  if (!(modelIdx >= 0 && modelIdx < MODELS.length)) modelIdx = 0;
+  var pm = param('model');
+  if (pm) {
+    var found = -1;
+    for (var i = 0; i < MODELS.length; i++) {
+      if (MODELS[i][0].toLowerCase() === pm.toLowerCase() || MODELS[i][1] === pm) found = i;
+    }
+    if (found >= 0) { modelIdx = found; save('cg_model', String(found)); }
+    else customModel = pm;      // any other model id, used as-is
+  }
+
+  // Keep the key out of the visible URL once it has been read.
+  if (param('key')) {
+    try { history.replaceState(null, '', location.pathname); } catch (e) { /* ignore */ }
+  }
+
+  function modelId() { return customModel || MODELS[modelIdx][1]; }
+  function modelName() { return customModel || MODELS[modelIdx][0]; }
+
+  // --- UI helpers ----------------------------------------------------------
+  function setStatus(s) { statusEl.textContent = s; }
+  function renderTitle() { titleEl.textContent = 'Claude · ' + modelName(); }
+  function idleStatus() {
+    var more = out.scrollHeight - out.clientHeight - out.scrollTop > 4;
+    setStatus(more ? '▼ more' : 'ready');
+  }
+  function show(question, answer) {
+    qEl.textContent = question || '';
+    aEl.textContent = answer || '';
+    out.scrollTop = 0;
+  }
+
+  /*SSE*/
+  // Feed raw text chunks from the streaming response; calls onText for each
+  // piece of answer text. Throws if the API reports an error mid-stream.
+  function makeSSE(onText) {
+    var buf = '';
+    function line(l) {
+      if (l.indexOf('data:') !== 0) return;
+      var payload = l.slice(5).trim();
+      if (!payload || payload === '[DONE]') return;
+      var ev;
+      try { ev = JSON.parse(payload); } catch (e) { return; }
+      if (ev.type === 'content_block_delta' && ev.delta && ev.delta.type === 'text_delta') {
+        onText(ev.delta.text);
+      } else if (ev.type === 'error') {
+        throw new Error((ev.error && ev.error.message) || 'stream error');
+      }
+    }
+    return {
+      feed: function (chunk) {
+        buf += chunk;
+        var parts = buf.split('\n');
+        buf = parts.pop();
+        for (var i = 0; i < parts.length; i++) line(parts[i].replace(/\r$/, ''));
+      },
+      end: function () { if (buf) { line(buf); buf = ''; } }
+    };
+  }
+  /*END*/
+
+  function errorText(status, body) {
+    var msg = '';
+    try { msg = JSON.parse(body).error.message; } catch (e) { msg = (body || '').slice(0, 160); }
+    if (status === 401) return 'API key rejected. Check the key in the app URL.';
+    if (status === 404) return 'Model not found: ' + modelId();
+    if (status === 429) return 'Rate limit or no credit left. ' + msg;
+    return 'HTTP ' + status + '. ' + msg;
+  }
+
+  // --- conversation --------------------------------------------------------
+  var msgs = [];
+  var busy = false;
+
+  async function ask(text) {
+    var q = (text || '').trim();
+    if (!q || busy) return;
+
+    if (!key) {
+      show(q, 'Text input works.\n\nNo API key yet. Open the app with your key in the URL:\n?key=sk-ant-...');
+      idleStatus();
+      return;
+    }
+
+    busy = true;
+    msgs.push({ role: 'user', content: q });
+    if (msgs.length > MAX_TURNS) msgs = msgs.slice(msgs.length - MAX_TURNS);
+    while (msgs.length && msgs[0].role !== 'user') msgs.shift();
+    show(q, '');
+    setStatus('thinking…');
+
+    var answer = '';
+    try {
+      var res = await fetch(API_URL, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-api-key': key,
+          'anthropic-version': '2023-06-01',
+          'anthropic-dangerous-direct-browser-access': 'true'
+        },
+        body: JSON.stringify({
+          model: modelId(),
+          max_tokens: 700,
+          system: SYSTEM,
+          messages: msgs,
+          stream: true
+        })
+      });
+      if (!res.ok) throw new Error(errorText(res.status, await res.text()));
+
+      var sse = makeSSE(function (t) {
+        answer += t;
+        aEl.textContent = answer;
+        setStatus('writing…');
+      });
+
+      if (res.body && res.body.getReader) {
+        var reader = res.body.getReader();
+        var dec = new TextDecoder();
+        for (;;) {
+          var r = await reader.read();
+          if (r.done) break;
+          sse.feed(dec.decode(r.value, { stream: true }));
+        }
+      } else {
+        sse.feed(await res.text());   // no streaming support: parse it all at once
+      }
+      sse.end();
+
+      if (!answer) throw new Error('Empty answer.');
+      msgs.push({ role: 'assistant', content: answer });
+    } catch (e) {
+      // Drop the unanswered question so the next request stays valid.
+      if (msgs.length && msgs[msgs.length - 1].role === 'user') msgs.pop();
+      var m = (e && e.message) || String(e);
+      if (/Failed to fetch|NetworkError|Load failed/i.test(m)) m = 'No connection to Claude. Check the phone internet.';
+      aEl.textContent = (answer ? answer + '\n\n' : '') + '⚠ ' + m;
+    } finally {
+      busy = false;
+      idleStatus();
+    }
+  }
+
+  // --- wiring --------------------------------------------------------------
+  function submit() {
+    var v = inp.value;
+    inp.value = '';
+    ask(v);
+  }
+  // The on-glasses composer commits text with input/change events; desktop uses Enter.
+  $('form').addEventListener('submit', function (e) { e.preventDefault(); submit(); });
+  inp.addEventListener('change', submit);
+
+  function page(dir) {
+    out.scrollTop += dir * Math.max(40, out.clientHeight * 0.8);
+    if (!busy) idleStatus();
+  }
+  $('up').addEventListener('click', function () { page(-1); });
+  $('down').addEventListener('click', function () { page(1); });
+
+  $('new').addEventListener('click', function () {
+    if (busy) return;
+    msgs = [];
+    show('', 'New chat.');
+    idleStatus();
+  });
+
+  $('model').addEventListener('click', function () {
+    customModel = null;
+    modelIdx = (modelIdx + 1) % MODELS.length;
+    save('cg_model', String(modelIdx));
+    renderTitle();
+  });
+
+  renderTitle();
+  show('', key
+    ? 'Select the field below and write your question.'
+    : 'Select the field below and write something to test input.\n\nTo talk to Claude, open the app with your API key in the URL:\n?key=sk-ant-...');
+  idleStatus();
+})();
+</script>
+</body>
+</html>
